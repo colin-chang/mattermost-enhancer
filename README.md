@@ -1,7 +1,7 @@
 # Hermes Mattermost Enhancer Plugin
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Hermes](https://img.shields.io/badge/Hermes-≥%200.14.0-blue)](https://github.com/nousresearch/hermes-agent)
+[![Hermes](https://img.shields.io/badge/Hermes-%E2%89%A5%20v2026.9-blue)](https://github.com/nousresearch/hermes-agent)
 [![Release](https://img.shields.io/github/v/release/colin-chang/hermes-plugin-mattermost-enhancer?label=release)](https://github.com/colin-chang/hermes-plugin-mattermost-enhancer/releases)
 
 English Version | [中文版本](./README.zh-CN.md)
@@ -157,12 +157,12 @@ Below are 11 bugs fixed by this project (plugin + companion shell script). Each 
 | **2** | Missing file spam: Hermes posts long error messages when an image/file can't be found | Chat flooded with `File not found: /tmp/xxx.png`, disrupting conversation | Silently skipped — no noise | Adapter Override |
 | **3** | AI questions too subtle: Hermes asks a question (multiple choice or open-ended) as plain text, easily missed in the conversation flow | You miss the question → no response → AI times out → also triggers a session split 💀 | Questions rendered as interactive cards with buttons — prominent and clickable | Adapter Override |
 | **4** | WebSocket frequent disconnects: Mattermost WebSocket disconnects every ~50s (close 258) | Brief message loss, duplicate messages, reply lag | Heartbeat optimized to 15s, connection stable | Adapter Override |
-| **5** | Media not routed to Thread: generated images/audio/video/documents appear in the main channel instead of the current Thread | You ask for an image in a Thread → image pops up in the channel, breaking the conversation flow 💀 | All media (images, audio, video, documents) correctly appear in the current Thread | Adapter Override |
+| **5** | Media not routed to Thread: generated images/audio/video/documents appear in the main channel instead of the current Thread | You ask for an image in a Thread → image pops up in the channel, breaking the conversation flow 💀 | All media (images, audio, video, documents) correctly appear in the current Thread | ~~Adapter Override~~ Fixed upstream (v2026.7.30+) |
 | **6** | DM approval missing user_id: Hermes can't determine which user to send the approval DM to | Approval cards may not arrive; dangerous commands may execute without approval | user_id properly passed; cards delivered on time | Adapter Override |
-| **7** | Tool progress not routed to Thread: multi-step task progress ("Searching...", "Reading file...") only appears in the main channel | You wait in a Thread with zero visibility into progress — result just pops out at the end 💀 | Progress messages correctly appear in the current Thread; you see every step in real time | Shell Patch |
-| **8** | Session split (AI amnesia): When AI is waiting for your clarify reply, your next message starts a new conversation — AI forgets everything | You're chatting fine in Thread A, then suddenly AI doesn't recognize you and gives random answers | Messages correctly delivered to the waiting AI; no new session created | Shell Patch |
-| **9** | Clarify concurrency guard: during clarify waiting, simultaneously arriving messages can bypass the session guard and create duplicate sessions | Two AI agents start responding to the same Thread — confusing duplicate replies | Intercepted at session guard before a new session spawns | Shell Patch |
-| **10** | Auto-resume session leaking: after Gateway restart, multiple Thread sessions in the same channel auto-resume simultaneously, responses cross between Threads | You see unrelated AI responses appearing in the wrong Thread after a restart | Deduplicates to most recent session per channel; Threads stay isolated | Shell Patch |
+| **7** | Tool progress not routed to Thread: multi-step task progress ("Searching...", "Reading file...") only appears in the main channel | You wait in a Thread with zero visibility into progress — result just pops out at the end 💀 | Progress messages correctly appear in the current Thread; you see every step in real time | ~~Shell Patch~~ Fixed upstream |
+| **8** | Session split (AI amnesia): When AI is waiting for your clarify reply, your next message starts a new conversation — AI forgets everything | You're chatting fine in Thread A, then suddenly AI doesn't recognize you and gives random answers | Messages correctly delivered to the waiting AI; no new session created | Shell Patch (E-P2) |
+| **9** | Clarify concurrency guard: during clarify waiting, simultaneously arriving messages can bypass the session guard and create duplicate sessions | Two AI agents start responding to the same Thread — confusing duplicate replies | Intercepted at session guard before a new session spawns | ~~Shell Patch~~ Fixed upstream |
+| **10** | Auto-resume session leaking: after Gateway restart, multiple Thread sessions in the same channel auto-resume simultaneously, responses cross between Threads | You see unrelated AI responses appearing in the wrong Thread after a restart | Deduplicates to most recent session per channel; Threads stay isolated | Shell Patch (E-P4) |
 | **11** | Response fragmentation: AI replies split into multiple separate messages (commentary and body sent separately) | One reply arrives as 3-5 messages, poor reading experience | Commentary merged into stream, one message does the job | Shell Patch (main script) |
 
 > 💡 **Bug #11** is fixed by the main `hermes-patches.sh` script (P50 commentary merge), not this plugin's companion script. See the main script in `~/.hermes/scripts/hermes-patches.sh`.
@@ -201,10 +201,12 @@ Bugs marked **Shell Patch** in the table above (#7-10) are exactly in that untou
 
 It fixes those plugin-unreachable bugs by modifying Hermes' source files with minimal changes:
 
-- **Companion script** (`scripts/hermes-mattermost-enhancer.sh`): Gateway-level patches specific to Mattermost interaction — tool progress in Thread (P1), clarify session handling (P2/P3), auto-resume dedup (P4), channel-root status routing (P5)
-- **Main script** (`~/.hermes/scripts/hermes-patches.sh`): Platform-agnostic Gateway fixes — commentary merge (P50), ghost code fences (P53), stream fallback reply routing (P55), plus CLI-level fixes (custom provider, model whitelist, cron encoding)
+- **Companion script** (`scripts/hermes-mattermost-enhancer.sh`): Gateway-level patches specific to Mattermost interaction — clarify session handling (E-P2), auto-resume dedup (E-P4). Retired with upstream releases: E-P1 (progress in Thread), E-P3 (concurrency guard), E-P5 (status routing)
+- **Main script** (`~/.hermes/scripts/hermes-patches.sh`): Platform-agnostic Gateway fixes — commentary merge, ghost code fences, stream fallback reply routing, plus CLI-level fixes (custom provider, model whitelist, cron encoding)
 
 > ⚠️ **Status:** These patches are maintained as local fixes. Some have been submitted upstream but are not yet merged into official Hermes releases. Running `check` after each Hermes upgrade is recommended — once upstream merges them, the scripts will report "already applied" and you can skip them.
+>
+> ⚠️ **The companion script does not restart the Gateway for you:** it contains no restart call (restarting from inside the gateway session is blocked by Hermes' safety hook, which would kill the whole script). After `apply`, restart the Gateway manually from an external terminal.
 
 ![Patch script output](images/patch.webp)
 
@@ -234,7 +236,7 @@ cd ~/.hermes/plugins/mattermost-enhancer
 
 ### Prerequisites
 
-- ✅ Running [Hermes Agent](https://github.com/nousresearch/hermes-agent) (≥ 0.14.0)
+- ✅ Running [Hermes Agent](https://github.com/nousresearch/hermes-agent) (v2026.9+)
 - ✅ Mattermost server with Bot account configured
 - ✅ Python 3.11+
 
@@ -384,14 +386,15 @@ A: No. They make minimal changes. You can check status anytime with `check`. To 
 
 **Q: What if I skip the scripts?**
 
-A: Several bugs remain unfixed (those marked "Shell Patch" above: #7-11):
-- Tool progress messages appear in the main channel, not in Threads
+A: Several bugs remain unfixed (those marked "Shell Patch" above: #8, #10):
 - Clarify session split: new messages during clarify waiting create separate sessions (AI forgets everything)
-- Duplicate sessions may spawn during clarify waiting
 - After Gateway restart, auto-resumed sessions in the same channel can leak between Threads
-- AI replies may be fragmented into multiple separate messages
 
-All adapter-override fixes (#1-6) work normally without the scripts.
+The other issues (#7 progress in Thread, #9 concurrency guard) are fixed upstream — no script needed. All adapter-override fixes (#1-6) work normally without the scripts.
+
+**Q: Why doesn't `apply` restart the Gateway automatically?**
+
+A: By design. Hermes' safety hook refuses gateway restarts issued from inside the gateway process; the old script's embedded restart call made even `check` unusable from a gateway session. The new script only applies patches and prints a hint — restart manually from an external terminal.
 
 ---
 

@@ -5,11 +5,19 @@ MattermostApprovalAdapter — 继承内置 MattermostAdapter，扩展 DM 审批 
   Mattermost 拦截所有 / 开头消息，必须注册 Slash Command 才能接收。
   Slash Command payload 不含 root_id，需要通过 Mattermost API 反查 thread 上下文。
 
-修复的问题：
-  1. 重复消息 → Slash Command 返回空 ephemeral，Bot API 发帖（唯一可见消息）
-  2. 模型切换无效 → 直接从 custom_providers 构建 session override（绕过 switch_model 路由）
-  3. 显示用户头像 → 使用 _api_post("posts", ...) 以 Bot 身份发帖
-  4. 模型排列混乱 → 按 provider 分组渲染，按钮名去掉 provider 前缀
+核心能力：
+  1. DM 审批卡片 → 多用户频道按消息真实发送者精确定位发起者
+  2. /model 模型切换卡片 → session_key 与 Gateway build_session_key 对齐
+  3. /new 会话重置确认卡片
+  4. Clarify 交互卡片（按钮选择 + 「其他」文本输入）
+  5. 独立线程回调服务器 → HTTP 响应与 gateway 主 loop 负载解耦
+  6. Typing 指示器进 Thread、WebSocket 心跳 15s、footer 编辑合并
+
+上游对齐（v2026.9.7）：
+  上游 bundled adapter 已原生实现 thread 路由（_post_message → root_id 解析 +
+  metadata.thread_id 降级 + broken-thread-root fallback）、mentions 抑制、
+  媒体文件 Thread 投递、消息分块 — 插件不再覆写这些方法，仅保留缓存版
+  _resolve_root_id 供上游多态调用。
 """
 from __future__ import annotations
 
@@ -17,7 +25,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from gateway.platforms.base import SendResult
 from tools.approval import resolve_gateway_approval
@@ -29,7 +37,7 @@ from tools.approval import resolve_gateway_approval
 # hermes_plugins.platforms_mattermost，然后才加载 mattermost-enhancer。
 # 正常场景下 try 分支即命中；fallback 仅在非标准环境（如直接 pytest）下触发。
 try:
-    from hermes_plugins.platforms_mattermost.adapter import MattermostAdapter, MAX_POST_LENGTH
+    from hermes_plugins.platforms_mattermost.adapter import MattermostAdapter
 except ImportError:
     import importlib.util
     import sys
@@ -52,7 +60,7 @@ except ImportError:
             _mod = importlib.util.module_from_spec(_spec)
             sys.modules["hermes_plugins.platforms_mattermost"] = _mod
             _spec.loader.exec_module(_mod)
-            from hermes_plugins.platforms_mattermost.adapter import MattermostAdapter, MAX_POST_LENGTH  # noqa: F811
+            from hermes_plugins.platforms_mattermost.adapter import MattermostAdapter  # noqa: F811
         else:
             raise
     else:
@@ -74,11 +82,10 @@ logger = logging.getLogger(__name__)
 class MattermostApprovalAdapter(MattermostAdapter):
     """Mattermost 适配器 — DM 审批 + /model 卡片 + /new 确认。"""
 
-    # Gateway stream_consumer 用 getattr(adapter, "MAX_MESSAGE_LENGTH", 4096)
-    # 获取消息长度限制。bundled adapter 只定义了 MAX_POST_LENGTH (4000)，
-    # 没有 MAX_MESSAGE_LENGTH，导致 gateway 使用默认值 4096——超出
-    # Mattermost 的 4000 字符限制，造成消息被静默截断。
-    MAX_MESSAGE_LENGTH = MAX_POST_LENGTH  # 4000
+    # 消息长度限制：上游 bundled adapter 已定义 MAX_MESSAGE_LENGTH 派生链，
+    # 基类 max_message_length_for_chat() 读取该属性（不存在时回退 4096）。
+    # 插件历史上曾用 MAX_MESSAGE_LENGTH = MAX_POST_LENGTH 修正 4096 > 4000
+    # 的截断差，现已由父类统一提供，不再重复定义。
 
     def __init__(self, config):
         super().__init__(config)
@@ -102,9 +109,9 @@ class MattermostApprovalAdapter(MattermostAdapter):
         )
         # DM channel 缓存: user_id → dm_channel_id
         self._dm_cache: Dict[str, str] = {}
-        # root_id 缓存: post_id → (root_id_or_None, timestamp)
-        # 避免每次 send() 都调 API GET（WebSocket 不稳定时频繁超时）
-        self._root_id_cache: Dict[str, Tuple[Optional[str], float]] = {}
+        # root_id 缓存: post_id → (root_id, timestamp)
+        # 避免每次发消息都调 API GET（WebSocket 不稳定时频繁超时）
+        self._root_id_cache: Dict[str, Tuple[str, float]] = {}
         self._root_id_cache_ttl: float = 300.0  # 5 分钟
         # Footer 追踪: chat_id → (post_id, content)
         # runtime footer 不独立发帖，而是编辑上一条消息追加到末尾
@@ -498,21 +505,6 @@ class MattermostApprovalAdapter(MattermostAdapter):
             logger.error("Error posting card: %s", e)
             return None
 
-    async def _update_bot_post(
-        self, post_id: str, message: str, props: Dict[str, Any],
-    ) -> bool:
-        """通过 Bot API 更新帖子内容。"""
-        try:
-            payload = {
-                "message": message,
-                "props": props,
-            }
-            data = await self._api_put(f"posts/{post_id}/patch", payload)
-            return bool(data and "id" in data)
-        except Exception as e:
-            logger.error("Error updating post %s: %s", post_id, e)
-            return False
-
     async def _handle_model_command(
         self, channel_id: str, user_id: str, root_id: Optional[str],
     ) -> Dict[str, Any]:
@@ -540,7 +532,9 @@ class MattermostApprovalAdapter(MattermostAdapter):
         )
 
         # 5. 注入 session_key + provider 到按钮 context
-        session_key = await self._build_session_key(channel_id, root_id)
+        # user_id 必传：group/channel 层级 session 默认 per-user 隔离，
+        # session key 带 user 后缀，缺它就写错 session。
+        session_key = await self._build_session_key(channel_id, root_id, user_id)
         self._inject_model_context(card, session_key)
 
         # 6. Bot API 发帖到 thread（Bot 头像，非用户头像）
@@ -570,7 +564,7 @@ class MattermostApprovalAdapter(MattermostAdapter):
             user_id=user_id,
         )
 
-        session_key = await self._build_session_key(channel_id, root_id)
+        session_key = await self._build_session_key(channel_id, root_id, user_id)
         self._inject_session_key(card, session_key)
 
         post_id = await self._post_card_in_thread(channel_id, root_id, card)
@@ -589,11 +583,17 @@ class MattermostApprovalAdapter(MattermostAdapter):
     # Session 上下文辅助
     # ══════════════════════════════════════════════════════════════════════
 
-    async def _build_session_key(self, channel_id: str, root_id: Optional[str]) -> str:
-        """构建 session_key，与 Gateway build_session_key 完全对齐。
+    async def _build_session_key(
+        self, channel_id: str, root_id: Optional[str], user_id: Optional[str] = None,
+    ) -> str:
+        """构建 session_key — 直接调用上游 build_session_key() 单一真源。
 
-        通过 Mattermost API 获取频道类型（"O"→channel, "G"/"P"→group, "D"→dm），
-        缓存结果避免重复 API 调用。
+        历史教训：手拼 f"agent:main:mattermost:{chat_type}:{channel_id}[:{root_id}]"
+        无法覆盖上游规则（group/channel 层级默认 per-user 隔离 → key 带 user 后缀；
+        thread 层级默认共享 → key 不带 user）。state.db 实测：
+          agent:main:mattermost:channel:{chat_id}:{thread_id}
+          agent:main:mattermost:group:{chat_id}:{user_id}
+        改用上游函数后与 Gateway 完全一致，per-user 差异由上游逻辑处理。
         """
         chat_type = self._channel_type_cache.get(channel_id)
         if chat_type is None:
@@ -603,10 +603,28 @@ class MattermostApprovalAdapter(MattermostAdapter):
             except Exception:
                 chat_type = "channel"
             self._channel_type_cache[channel_id] = chat_type
-        key = f"agent:main:mattermost:{chat_type}:{channel_id}"
-        if root_id:
-            key += f":{root_id}"
-        return key
+
+        try:
+            from gateway.session import SessionSource, build_session_key
+            from gateway.config import Platform
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            source = SessionSource(
+                platform=Platform.MATTERMOST, chat_id=str(channel_id),
+                chat_type=chat_type, user_id=user_id or None,
+                thread_id=root_id or None,
+            )
+            return build_session_key(
+                source,
+                group_sessions_per_user=bool(cfg.get("group_sessions_per_user", True)),
+                thread_sessions_per_user=bool(cfg.get("thread_sessions_per_user", False)),
+            )
+        except Exception:
+            logger.warning("Mattermost: build_session_key fallback (upstream import failed)", exc_info=True)
+            key = f"agent:main:mattermost:{chat_type}:{channel_id}"
+            if root_id:
+                key += f":{root_id}"
+            return key
 
     async def _get_current_model_for_session(
         self, channel_id: str, root_id: Optional[str],
@@ -924,10 +942,8 @@ class MattermostApprovalAdapter(MattermostAdapter):
             update = {"message": f"❌ 切换失败: {message}", "props": {}}
 
         try:
-            await self._api_put(
-                f"posts/{root_post_id}/patch",
-                {"message": update.get("message", ""), "props": update.get("props", {})},
-            )
+            await self._api("PUT", f"posts/{root_post_id}/patch",
+                            {"message": update.get("message", ""), "props": update.get("props", {})})
         except Exception:
             logger.error(
                 "Model switch followup: failed to patch post %s",
@@ -1019,10 +1035,8 @@ class MattermostApprovalAdapter(MattermostAdapter):
             else {"message": f"❌ 重置失败: {message}", "props": {}}
         )
         try:
-            await self._api_put(
-                f"posts/{root_post_id}/patch",
-                {"message": update.get("message", ""), "props": update.get("props", {})},
-            )
+            await self._api("PUT", f"posts/{root_post_id}/patch",
+                            {"message": update.get("message", ""), "props": update.get("props", {})})
         except Exception:
             logger.error(
                 "New confirm followup: failed to patch post %s",
@@ -1418,23 +1432,13 @@ class MattermostApprovalAdapter(MattermostAdapter):
             return False, str(e)
 
     # ══════════════════════════════════════════════════════════════════════
-    # Gateway 标准钩子（forward compat，当前因 Mattermost 拦截 / 不会触发）
+    # （send_model_picker 已移除 — v2026.9.7 对齐）
+    # 上游 slash_commands_model._model_listing_reply 通过
+    # `getattr(type(adapter), "send_model_picker", None)` 探测交互 picker 能力。
+    # 旧插件覆写永远返回失败 SendResult，会让上游误判「picker 可用」后收到失败
+    # 并中断文本降级链路。删除后 /model 走上游统一实现；插件自己的 /model
+    # Slash Command 卡片入口不受影响。
     # ══════════════════════════════════════════════════════════════════════
-
-    async def send_model_picker(
-        self,
-        chat_id: str,
-        providers: list,
-        current_model: str,
-        current_provider: str,
-        session_key: str,
-        on_model_selected: Callable[[str, str, str], Coroutine[Any, Any, str]],
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Gateway 标准 hook — 当前 Mattermost 拦截 / 消息，此方法不会被调用。
-        保留用于未来兼容（如 Mattermost 改进 Slash Command 支持时）。
-        """
-        return SendResult(success=False, error="Use Slash Command /model instead")
 
     # ══════════════════════════════════════════════════════════════════════
     # 回调服务器辅助方法
@@ -1570,11 +1574,16 @@ class MattermostApprovalAdapter(MattermostAdapter):
         await super().disconnect()
 
     # ══════════════════════════════════════════════════════════════════════
-    # Thread root_id 解析（替代 patch 6）
+    # Thread root_id 解析 — 缓存版覆写（v2026.9.7 对齐）
     # ══════════════════════════════════════════════════════════════════════
+    # 上游 _post_message 在 thread 模式下对每个候选（reply_to 或
+    # metadata.thread_id）调用 self._resolve_root_id(...)。覆写为缓存版 +
+    # 签名对齐上游（post_id: str -> str）：None/异常时回退返回 post_id 本身，
+    # 与上游「不解析、按根帖处理」的语义一致，避免 Optional 返回值泄漏进
+    # 上游调用链导致 thread 路由静默失效。
 
-    async def _resolve_root_id(self, post_id: str) -> Optional[str]:
-        """Resolve a post_id to the thread root_id for Mattermost.
+    async def _resolve_root_id(self, post_id: str) -> str:
+        """Resolve a post_id to the thread root_id for Mattermost (cached).
 
         Mattermost requires root_id to be the *root* post of a thread.
         If the post is a reply (has its own root_id), we must use that
@@ -1583,13 +1592,11 @@ class MattermostApprovalAdapter(MattermostAdapter):
 
         Results are cached for 5 minutes to avoid repeated API calls
         (especially important when WebSocket is unstable and API calls
-        frequently time out).
-
-        Returns None when resolution fails (API error, network issue) —
-        callers MUST skip root_id in that case to avoid 400 errors.
+        frequently time out). Failures fall back to returning post_id
+        itself — matching the upstream contract (str in, str out).
         """
         if not post_id:
-            return None
+            return post_id
 
         # ── 缓存命中 ──
         import time as _time
@@ -1611,18 +1618,18 @@ class MattermostApprovalAdapter(MattermostAdapter):
         except Exception:
             logger.warning(
                 "Mattermost: _resolve_root_id — API call failed for post=%s, "
-                "skipping thread routing",
+                "falling back to post_id itself",
                 post_id, exc_info=True,
             )
-            return None
+            return post_id
 
-        if data is None:
+        if not data:
             logger.warning(
-                "Mattermost: _resolve_root_id — API returned None for post=%s, "
-                "skipping thread routing",
+                "Mattermost: _resolve_root_id — API returned no data for post=%s, "
+                "falling back to post_id itself",
                 post_id,
             )
-            return None
+            return post_id
 
         root_id = data.get("root_id")
         # root_id can be "" (empty string = this post IS the root).
@@ -1663,8 +1670,12 @@ class MattermostApprovalAdapter(MattermostAdapter):
         return result
 
     # ══════════════════════════════════════════════════════════════════════
-    # edit_message() 覆写 — 修复上游 _api_put 缺少 timeout 的 Bug
+    # edit_message() — 轻量覆写（v2026.9.7 对齐）
     # ══════════════════════════════════════════════════════════════════════
+    # 上游已统一 _api("PUT") 并带 30s timeout，旧的「_api_put 无限挂起」
+    # bug 已不存在。保留覆写仅为了：(1) 接受 gateway 各调用方传入的
+    # metadata kwarg（上游 edit_message 签名没有该参数）；(2) 空内容防护
+    # （MM API 对空 message 返回 400 并刷错误日志）。内容非空时直接委托上游。
 
     async def edit_message(
         self,
@@ -1675,14 +1686,8 @@ class MattermostApprovalAdapter(MattermostAdapter):
         finalize: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Edit an existing post — 覆写父类，添加 timeout 和空内容防护.
-
-        上游 bundled adapter 的 edit_message 调用 _api_put 时未设置 timeout，
-        而 _api_get/_api_post 都设置了 timeout=30s。当 WebSocket 不稳定导致
-        HTTP 连接池异常时，_api_put 会无限挂起或抛出 asyncio.TimeoutError
-        （其 str() 为空字符串，导致 gateway 日志中只显示 "Stream send/edit
-        error: " 而无有用信息）。
-        """
+        """Edit an existing post — metadata kwarg 兼容 + 空内容防护."""
+        _ = metadata, finalize  # 接受但不使用（metadata 由上游 thread 路由处理）
         if not content or not content.strip():
             logger.debug(
                 "Mattermost: edit_message skipped — empty content for post=%s",
@@ -1690,56 +1695,7 @@ class MattermostApprovalAdapter(MattermostAdapter):
             )
             return SendResult(success=False, error="empty message")
 
-        formatted = self.format_message(content)
-        if not formatted or not formatted.strip():
-            logger.debug(
-                "Mattermost: edit_message skipped — empty after format_message for post=%s",
-                message_id,
-            )
-            return SendResult(success=False, error="empty message after formatting")
-
-        import aiohttp
-        url = f"{self._base_url}/api/v4/posts/{message_id}/patch"
-        try:
-            async with self._session.put(
-                url,
-                headers=self._headers(),
-                json={"message": formatted},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.error(
-                        "MM API PUT posts/%s/patch → %s: %s",
-                        message_id, resp.status, body[:200],
-                    )
-                    return SendResult(
-                        success=False,
-                        error=f"HTTP {resp.status}: {body[:100]}",
-                    )
-                data = await resp.json()
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Mattermost: edit_message timeout (30s) for post=%s",
-                message_id,
-            )
-            return SendResult(success=False, error="edit timeout (30s)")
-        except aiohttp.ClientError as exc:
-            logger.error(
-                "MM API PUT posts/%s/patch network error: %s",
-                message_id, exc,
-            )
-            return SendResult(success=False, error=f"network error: {exc}")
-        except Exception as exc:
-            logger.error(
-                "MM API PUT posts/%s/patch unexpected error: %s",
-                message_id, exc, exc_info=True,
-            )
-            return SendResult(success=False, error=f"unexpected error: {exc}")
-
-        if not data or "id" not in data:
-            return SendResult(success=False, error="Failed to edit post")
-        return SendResult(success=True, message_id=data["id"])
+        return await super().edit_message(chat_id, message_id, content, finalize=finalize)
 
     async def _get_thread_root_id(self, reply_to: Optional[str]) -> Optional[str]:
         """Resolve reply_to → thread root_id when in thread mode."""
@@ -1748,8 +1704,12 @@ class MattermostApprovalAdapter(MattermostAdapter):
         return None
 
     # ══════════════════════════════════════════════════════════════════════
-    # send() 覆写 — 添加 _resolve_root_id（替代 patch 6a）
+    # send() — footer 拦截 + 委托上游（v2026.9.7 对齐）
     # ══════════════════════════════════════════════════════════════════════
+    # 旧版手搓了完整发送链路（root_id 解析、metadata 降级、分块、发帖），
+    # 与上游 _post_message() 完全重复且缺少 mentions 抑制与 broken-thread-root
+    # fallback。v2026.9.7 起仅保留插件特色 —— footer 行编辑合并到上一条消息，
+    # 其余全部委托上游 send()（thread 路由经缓存的 _resolve_root_id 仍然生效）。
 
     async def send(
         self,
@@ -1758,7 +1718,7 @@ class MattermostApprovalAdapter(MattermostAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """覆写父类 send()：将 root_id 解析为 thread 根帖子 ID."""
+        """footer 拦截 + 委托父类 send()。"""
         if not content:
             return SendResult(success=True)
 
@@ -1770,18 +1730,11 @@ class MattermostApprovalAdapter(MattermostAdapter):
                 # 实时拉取当前帖子内容（流式模式下 send() 收到的 content 不完整）
                 current = await self._api_get(f"posts/{post_id}")
                 current_text = current.get("message", "") if isinstance(current, dict) else ""
-                if not current_text:
-                    logger.warning(
-                        "Mattermost: footer edit skipped — failed to fetch post=%s content",
-                        post_id,
-                    )
-                    # 降级：回退为正常发送
-                else:
+                if current_text:
                     footer_text = content.replace(" · ", " ")
                     footer_md = f"`── {footer_text} ──`"
                     edited = f"{current_text}\n\n{footer_md}"
-                    # 使用覆写的 edit_message（带 timeout 和错误处理），
-                    # 而非直接调 _api_put（上游缺 timeout）。
+                    # 使用覆写的 edit_message（带 timeout 和错误处理）
                     edit_result = await self.edit_message(
                         chat_id=chat_id,
                         message_id=post_id,
@@ -1791,73 +1744,23 @@ class MattermostApprovalAdapter(MattermostAdapter):
                         self._tracked_posts[chat_id] = (post_id, edited)
                         return SendResult(success=True, message_id=post_id)
                     logger.warning(
-                        "Mattermost: footer edit failed for post=%s, "
-                        "fallback to normal send",
+                        "Mattermost: footer edit failed for post=%s, fallback to normal send",
+                        post_id,
+                    )
+                else:
+                    logger.warning(
+                        "Mattermost: footer edit skipped — failed to fetch post=%s content",
                         post_id,
                     )
             # 无追踪帖子或编辑/拉取失败 → 正常发送（降级）
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, MAX_POST_LENGTH)
-
-        last_id = None
-        for chunk in chunks:
-            payload: Dict[str, Any] = {
-                "channel_id": chat_id,
-                "message": chunk,
-            }
-            if reply_to and self._reply_mode == "thread":
-                root_id = await self._resolve_root_id(reply_to)
-                if root_id:
-                    payload["root_id"] = root_id
-                    logger.info(
-                        "Mattermost: send() threading — reply_to=%s resolved_root=%s "
-                        "reply_mode=%s chat_id=%s",
-                        reply_to, root_id, self._reply_mode, chat_id,
-                    )
-                elif metadata and metadata.get("thread_id"):
-                    # _resolve_root_id 失败时降级使用 metadata.thread_id，
-                    # 避免消息落到频道级（而非正确的 Thread）。
-                    payload["root_id"] = str(metadata["thread_id"])
-                    logger.warning(
-                        "Mattermost: send() — _resolve_root_id returned None for "
-                        "reply_to=%s, falling back to metadata.thread_id=%s",
-                        reply_to, metadata["thread_id"],
-                    )
-                else:
-                    logger.warning(
-                        "Mattermost: send() — _resolve_root_id returned None for "
-                        "reply_to=%s, no metadata fallback — sending without thread routing",
-                        reply_to,
-                    )
-            elif self._reply_mode == "thread" and metadata and metadata.get("thread_id"):
-                # 替代 patch 8b：reply_to 未提供时降级使用 metadata.thread_id。
-                # 工具进度消息等场景下 _progress_reply_to 为 None，但
-                # _progress_metadata 中已携带 thread_id（= source.thread_id），
-                # 在 Mattermost 中即为 root post ID，无需额外解析。
-                payload["root_id"] = str(metadata["thread_id"])
-                logger.info(
-                    "Mattermost: send() threading from metadata fallback — "
-                    "thread_id=%s chat_id=%s",
-                    payload["root_id"], chat_id,
-                )
-            elif reply_to and self._reply_mode != "thread":
-                logger.info(
-                    "Mattermost: send() reply_to present but reply_mode=%s (not 'thread') — "
-                    "skipping root_id — reply_to=%s chat_id=%s",
-                    self._reply_mode, reply_to, chat_id,
-                )
-
-            data = await self._post_preserving_thread(chat_id, payload, metadata)
-            if not data or "id" not in data:
-                return SendResult(success=False, error="Failed to create post")
-            last_id = data["id"]
+        result = await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
 
         # 追踪非 footer 帖子（用于后续 footer 编辑合并到上一条消息）
-        if last_id and not self._is_footer_line(content):
-            self._tracked_posts[chat_id] = (last_id, content)
+        if result.success and result.message_id and not self._is_footer_line(content):
+            self._tracked_posts[chat_id] = (result.message_id, content)
 
-        return SendResult(success=True, message_id=last_id)
+        return result
 
     # ══════════════════════════════════════════════════════════════════════
     # send_clarify() 覆写 — 渲染交互卡片替代纯文本（替代 base.send_clarify）
@@ -1933,310 +1836,12 @@ class MattermostApprovalAdapter(MattermostAdapter):
         )
 
     # ══════════════════════════════════════════════════════════════════════
-    # send_multiple_images() 覆写 — metadata → root_id（图片批量不进 Thread）
+    # （媒体/文件类覆写已全部移除 — v2026.9.7 上游对齐）
+    # 上游 _post_message() 已原生实现：reply_to / metadata.thread_id /
+    # metadata.root_id → root_id 解析（经插件缓存版 _resolve_root_id）、
+    # mentions 抑制（_with_mentions_disabled）、broken-thread-root 降级。
+    # 受影响的已删覆写：send_multiple_images / send_image / send_image_file /
+    # send_document / send_video / send_voice / _derive_reply_to /
+    # _send_local_file（静默跳过已在上游实现）/ _send_url_as_file。
+    # gateway 对这些方法的调用（含 metadata kwarg）均走上游签名，行为一致。
     # ══════════════════════════════════════════════════════════════════════
-
-    async def send_multiple_images(
-        self,
-        chat_id: str,
-        images: List[Tuple[str, str]],
-        metadata: Optional[Dict[str, Any]] = None,
-        human_delay: float = 0.0,
-    ) -> None:
-        """覆写父类 send_multiple_images：从 metadata 提取 thread_id 注入 root_id.
-
-        bundled adapter 的 send_multiple_images 接收 metadata 但构建 payload
-        时完全忽略，导致图片/媒体批量发送始终落到频道级而非 Thread。
-        """
-        if not images:
-            return
-
-        import mimetypes
-        import aiohttp
-        from pathlib import Path
-        from urllib.parse import unquote as _unquote
-
-        CHUNK = 5  # Mattermost post file_ids cap
-        chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
-
-        # 提前解析 thread root_id（所有 chunk 共用）
-        root_id: Optional[str] = None
-        if metadata and metadata.get("thread_id"):
-            root_id = await self._get_thread_root_id(metadata["thread_id"])
-
-        for chunk_idx, chunk in enumerate(chunks):
-            if human_delay > 0 and chunk_idx > 0:
-                await asyncio.sleep(human_delay)
-
-            file_ids: List[str] = []
-            caption_parts: List[str] = []
-            try:
-                for image_url, alt_text in chunk:
-                    if alt_text:
-                        caption_parts.append(alt_text)
-
-                    if image_url.startswith("file://"):
-                        local_path = _unquote(image_url[7:])
-                        p = Path(local_path)
-                        if not p.exists():
-                            logger.warning("Mattermost: skipping missing image %s", local_path)
-                            continue
-                        fname = p.name
-                        ct = mimetypes.guess_type(fname)[0] or "image/png"
-                        file_data = p.read_bytes()
-                    else:
-                        from tools.url_safety import is_safe_url
-                        if not is_safe_url(image_url):
-                            logger.warning("Mattermost: blocked unsafe image URL in batch")
-                            continue
-                        try:
-                            async with self._session.get(
-                                image_url, timeout=aiohttp.ClientTimeout(total=30)
-                            ) as resp:
-                                if resp.status >= 400:
-                                    logger.warning(
-                                        "Mattermost: failed to download image (HTTP %d): %s",
-                                        resp.status, image_url[:80],
-                                    )
-                                    continue
-                                file_data = await resp.read()
-                                ct = resp.content_type or "image/png"
-                        except Exception as dl_err:
-                            logger.warning("Mattermost: download failed for %s: %s", image_url[:80], dl_err)
-                            continue
-                        fname = image_url.rsplit("/", 1)[-1].split("?")[0] or f"image_{len(file_ids)}.png"
-
-                    fid = await self._upload_file(chat_id, file_data, fname, ct)
-                    if fid:
-                        file_ids.append(fid)
-
-                if not file_ids:
-                    continue
-
-                payload: Dict[str, Any] = {
-                    "channel_id": chat_id,
-                    "message": "\n".join(caption_parts),
-                    "file_ids": file_ids,
-                }
-                # 🔧 修复：注入 root_id 确保图片进 Thread
-                if root_id:
-                    payload["root_id"] = root_id
-
-                logger.info(
-                    "Mattermost: sending %d image(s) as single post (chunk %d/%d)",
-                    len(file_ids), chunk_idx + 1, len(chunks),
-                )
-                data = await self._post_preserving_thread(chat_id, payload, metadata)
-                if not data or "id" not in data:
-                    logger.warning("Mattermost: multi-image post failed, falling back")
-                    await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
-            except Exception as e:
-                logger.warning(
-                    "Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
-                    chunk_idx + 1, len(chunks), e, exc_info=True,
-                )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
-
-    # ══════════════════════════════════════════════════════════════════════
-    # send_image / send_video / send_document 覆写 — metadata → reply_to 推导
-    # ══════════════════════════════════════════════════════════════════════
-    # 这些方法接收 metadata 但不使用它来推导 reply_to。Gateway 调用时传入
-    # metadata._thread_meta (包含 thread_id)，但 bundled adapter 直接丢弃。
-    # 覆写后从 metadata 推导 reply_to，后续 _send_local_file / _send_url_as_file
-    # 已有覆写会正确处理 Thread 路由。
-
-    def _derive_reply_to(
-        self,
-        reply_to: Optional[str],
-        metadata: Optional[Dict[str, Any]],
-    ) -> Optional[str]:
-        """从 metadata 推导 reply_to 当显式 reply_to 未提供时."""
-        if reply_to is None and metadata and metadata.get("thread_id"):
-            return metadata["thread_id"]
-        return reply_to
-
-    async def send_image(
-        self,
-        chat_id: str,
-        image_url: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """覆写父类 send_image：metadata → reply_to 推导."""
-        reply_to = self._derive_reply_to(reply_to, metadata)
-        return await self._send_url_as_file(
-            chat_id, image_url, caption, reply_to, "image", metadata=metadata
-        )
-
-    async def send_image_file(
-        self,
-        chat_id: str,
-        image_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """覆写父类 send_image_file：metadata → reply_to 推导."""
-        reply_to = self._derive_reply_to(reply_to, metadata)
-        return await self._send_local_file(
-            chat_id, image_path, caption, reply_to, metadata=metadata
-        )
-
-    async def send_document(
-        self,
-        chat_id: str,
-        file_path: str,
-        caption: Optional[str] = None,
-        file_name: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """覆写父类 send_document：metadata → reply_to 推导."""
-        reply_to = self._derive_reply_to(reply_to, metadata)
-        return await self._send_local_file(
-            chat_id, file_path, caption, reply_to, file_name, metadata=metadata
-        )
-
-    async def send_video(
-        self,
-        chat_id: str,
-        video_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """覆写父类 send_video：metadata → reply_to 推导."""
-        reply_to = self._derive_reply_to(reply_to, metadata)
-        return await self._send_local_file(
-            chat_id, video_path, caption, reply_to, metadata=metadata
-        )
-
-    async def send_voice(
-        self,
-        chat_id: str,
-        audio_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """覆写父类 send_voice：metadata → reply_to 推导."""
-        reply_to = self._derive_reply_to(reply_to, metadata)
-        return await self._send_local_file(
-            chat_id, audio_path, caption, reply_to, metadata=metadata
-        )
-
-    # ══════════════════════════════════════════════════════════════════════
-    # _send_local_file() 覆写 — MEDIA 静默跳过 + _resolve_root_id（替代 patch 6c + 10c）
-    # ══════════════════════════════════════════════════════════════════════
-
-    async def _send_local_file(
-        self,
-        chat_id: str,
-        file_path: str,
-        caption: Optional[str],
-        reply_to: Optional[str],
-        file_name: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """覆写父类 _send_local_file：文件不存在时静默跳过 + Thread root_id 解析."""
-        import mimetypes
-        from pathlib import Path as _Path
-
-        p = _Path(file_path)
-        if not p.exists():
-            # 替代 patch 10c：静默跳过，不发噪声消息到频道
-            logger.warning(
-                "Mattermost: local file not found, skipping: %s", file_path
-            )
-            return SendResult(success=True, message_id=None)
-
-        fname = file_name or p.name
-        ct = mimetypes.guess_type(fname)[0] or "application/octet-stream"
-        file_data = p.read_bytes()
-
-        file_id = await self._upload_file(chat_id, file_data, fname, ct)
-        if not file_id:
-            return SendResult(success=False, error="File upload failed")
-
-        payload: Dict[str, Any] = {
-            "channel_id": chat_id,
-            "message": caption or "",
-            "file_ids": [file_id],
-        }
-        root_id = await self._get_thread_root_id(reply_to)
-        if root_id:
-            payload["root_id"] = root_id
-
-        data = await self._post_preserving_thread(chat_id, payload, metadata)
-        if not data or "id" not in data:
-            return SendResult(success=False, error="Failed to post with file")
-        return SendResult(success=True, message_id=data["id"])
-
-    # ══════════════════════════════════════════════════════════════════════
-    # _send_url_as_file() 覆写 — 添加 _resolve_root_id（替代 patch 6b）
-    # ══════════════════════════════════════════════════════════════════════
-
-    async def _send_url_as_file(
-        self,
-        chat_id: str,
-        url: str,
-        caption: Optional[str],
-        reply_to: Optional[str],
-        kind: str = "file",
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """覆写父类 _send_url_as_file：添加 Thread root_id 解析."""
-        from tools.url_safety import is_safe_url
-        if not is_safe_url(url):
-            logger.warning("Mattermost: blocked unsafe URL (SSRF protection)")
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
-
-        import aiohttp
-
-        file_data = None
-        ct = "application/octet-stream"
-        fname = url.rsplit("/", 1)[-1].split("?")[0] or f"{kind}.png"
-
-        for attempt in range(3):
-            try:
-                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status >= 500 or resp.status == 429:
-                        if attempt < 2:
-                            logger.debug("Mattermost download retry %d/2 for %s (status %d)",
-                                         attempt + 1, url[:80], resp.status)
-                            await asyncio.sleep(1.5 * (attempt + 1))
-                            continue
-                    if resp.status >= 400:
-                        return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
-                    file_data = await resp.read()
-                    ct = resp.content_type or "application/octet-stream"
-                    break
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if attempt < 2:
-                    await asyncio.sleep(1.5 * (attempt + 1))
-                    continue
-                logger.warning("Mattermost: failed to download %s after %d attempts: %s", url, attempt + 1, exc)
-                return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
-
-        if file_data is None:
-            logger.warning("Mattermost: download returned no data for %s", url)
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
-
-        file_id = await self._upload_file(chat_id, file_data, fname, ct)
-        if not file_id:
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
-
-        payload: Dict[str, Any] = {
-            "channel_id": chat_id,
-            "message": caption or "",
-            "file_ids": [file_id],
-        }
-        root_id = await self._get_thread_root_id(reply_to)
-        if root_id:
-            payload["root_id"] = root_id
-
-        data = await self._post_preserving_thread(chat_id, payload, metadata)
-        if not data or "id" not in data:
-            return SendResult(success=False, error="Failed to post with file")
-        return SendResult(success=True, message_id=data["id"])

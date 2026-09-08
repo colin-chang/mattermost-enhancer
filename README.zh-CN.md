@@ -1,7 +1,7 @@
 # Hermes Mattermost Enhancer Plugin
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Hermes](https://img.shields.io/badge/Hermes-≥%200.14.0-blue)](https://github.com/nousresearch/hermes-agent)
+[![Hermes](https://img.shields.io/badge/Hermes-%E2%89%A5%20v2026.9-blue)](https://github.com/nousresearch/hermes-agent)
 [![Release](https://img.shields.io/github/v/release/colin-chang/hermes-plugin-mattermost-enhancer?label=release)](https://github.com/colin-chang/hermes-plugin-mattermost-enhancer/releases)
 
 [English Version](./README.md) | 中文版本
@@ -157,13 +157,13 @@ Hermes 是一个 AI 助手，你可以在 Mattermost 里跟它对话，让它帮
 | **2** | 文件不存在时刷屏：Hermes 要发送的图片/文件找不到了，会在聊天里贴一大段错误信息 | 聊天被 `File not found: /tmp/xxx.png` 刷屏，干扰正常对话 | 文件不存在时静默跳过，不打扰你 | Adapter 覆写 |
 | **3** | AI 提问不显眼：Hermes 向你提问时，只发一行纯文本，混在对话流里容易被错过 | 你没看到问题 → 没回复 → AI 卡住超时 → 触发会话分裂 💀 | 提问渲染为带按钮的交互卡片，醒目且可点击 | Adapter 覆写 |
 | **4** | WebSocket 频繁断连：Mattermost WebSocket 每 ~50 秒断开重连（close 258） | 短暂消息丢失、重复消息、回复卡顿 | 心跳优化到 15 秒，连接稳定 | Adapter 覆写 |
-| **5** | 媒体不进 Thread：AI 生成的图片/音频/视频/文档出现在频道主聊天流，而不是当前 Thread | 你在 Thread 里让 AI 生图 → 图片跳到频道主聊天流，打乱对话节奏 💀 | 所有媒体（图片、音频、视频、文档）正确出现在当前 Thread 中 | Adapter 覆写 |
+| **5** | 媒体不进 Thread：AI 生成的图片/音频/视频/文档出现在频道主聊天流，而不是当前 Thread | 你在 Thread 里让 AI 生图 → 图片跳到频道主聊天流，打乱对话节奏 💀 | 所有媒体（图片、音频、视频、文档）正确出现在当前 Thread 中 | ~~Adapter 覆写~~ 上游已修复 (v2026.7.30+) |
 | **6** | DM 审批不知道发给谁：Hermes 要发审批私信，但不知道发给哪个用户（user_id 没传过来） | 审批卡片可能无法送达，危险操作可能被直接执行 | 追踪每条消息的真实发送者，审批卡片准确送达发起人 | Adapter 覆写 |
 | **6b** | 多用户频道审批发错人：多个用户在同一频道（公开/群组）时，审批私信误发给管理员（members 反查只取第一个非 bot 成员），发起者本人收不到 | 普通用户发起危险操作 → 审批卡片跑到管理员 DM，本人完全不知情 💀 | 按消息真实发送者精确定位审批接收人，不再误发管理员 | Adapter 覆写 |
-| **7** | 工具链进度不进 Thread：Hermes 执行多步任务时，中间的进度提示只出现在频道主聊天流 | 你在 Thread 里等结果，过程中完全看不到进展 💀 | 进度消息正确出现在当前 Thread，实时看到每一步 | Shell Patch |
-| **8** | 会话分裂（AI 答非所问）：AI 在等待你回复 clarify 提问时，你发的下一条消息被当成"新对话"开启 | AI 完全失忆，开始瞎答 | 消息正确路由给等待中的 AI，不再创建新会话 | Shell Patch |
-| **9** | Clarify 并发守护缺失：在 clarify 等待期间，同时到达的消息可能绕过会话守卫创建重复会话 | 两个 AI 同时回复同一个 Thread，回复混乱 | 在创建新会话前拦截，路由到等待中的 clarify | Shell Patch |
-| **10** | auto-resume 串台：Gateway 重启后，同一频道多个 Thread 的 session 同时自动恢复，消息跨 Thread 泄漏 | 重启后在 Thread A 里看到 Thread B 的 AI 回复 | 每频道只恢复最近一个 session，Thread 之间互不干扰 | Shell Patch |
+| **7** | 工具链进度不进 Thread：Hermes 执行多步任务时，中间的进度提示只出现在频道主聊天流 | 你在 Thread 里等结果，过程中完全看不到进展 💀 | 进度消息正确出现在当前 Thread，实时看到每一步 | ~~Shell Patch~~ 上游已修复 |
+| **8** | 会话分裂（AI 答非所问）：AI 在等待你回复 clarify 提问时，你发的下一条消息被当成"新对话"开启 | AI 完全失忆，开始瞎答 | 消息正确路由给等待中的 AI，不再创建新会话 | Shell Patch (E-P2) |
+| **9** | Clarify 并发守护缺失：在 clarify 等待期间，同时到达的消息可能绕过会话守卫创建重复会话 | 两个 AI 同时回复同一个 Thread，回复混乱 | 在创建新会话前拦截，路由到等待中的 clarify | ~~Shell Patch~~ 上游已修复 |
+| **10** | auto-resume 串台：Gateway 重启后，同一频道多个 Thread 的 session 同时自动恢复，消息跨 Thread 泄漏 | 重启后在 Thread A 里看到 Thread B 的 AI 回复 | 每频道只恢复最近一个 session，Thread 之间互不干扰 | Shell Patch (E-P4) |
 | **11** | 回复碎片化：AI 回复被拆成多条独立消息（评论文字和正文分开发送） | 一次回复收到 3-5 条消息，阅读体验差 | 评论合并到正文流中，一条消息搞定 | Shell Patch（主脚本） |
 
 > 💡 **Bug #11** 由主脚本 `hermes-patches.sh` 修复（P50 评论合并），不是本插件的配套脚本。详见 `~/.hermes/scripts/hermes-patches.sh`。
@@ -202,10 +202,12 @@ Hermes 是一个 AI 助手，你可以在 Mattermost 里跟它对话，让它帮
 
 修那些插件够不到的 Bug。分两个脚本：
 
-- **配套脚本**（`scripts/hermes-mattermost-enhancer.sh`）：Mattermost 交互专属的 Gateway 层修复 — 工具进度进 Thread (P1)、clarify 会话处理 (P2/P3)、auto-resume 去重 (P4)、Channel-root 状态路由 (P5)
-- **主脚本**（`~/.hermes/scripts/hermes-patches.sh`）：平台无关的通用 Gateway 修复 — 评论合并 (P50)、幽灵代码围栏 (P53)、fallback 消息 Thread 路由 (P55)，以及 CLI 层修复（自定义 provider、模型白名单、cron 编码）
+- **配套脚本**（`scripts/hermes-mattermost-enhancer.sh`）：Mattermost 交互专属的 Gateway 层修复 — clarify 会话处理 (E-P2)、auto-resume 去重 (E-P4)。已修复的 E-P1（进度进 Thread）、E-P3（并发守护）、E-P5（Status 路由）随上游版本退役
+- **主脚本**（`~/.hermes/scripts/hermes-patches.sh`）：平台无关的通用 Gateway 修复 — 评论合并、幽灵代码围栏、fallback 消息 Thread 路由，以及 CLI 层修复（自定义 provider、模型白名单、cron 编码）
 
 > ⚠️ **当前状态：** 这些补丁目前以本地修复方式维护。部分已提交上游但尚未合入 Hermes 官方版本。建议每次升级 Hermes 后运行 `check` 确认状态——一旦上游合入，脚本会报告"已应用"。
+>
+> ⚠️ **配套脚本不会替你重启 Gateway**：脚本内不含重启调用（在 gateway 会话里执行重启会被 Hermes 安全钩子拦截，导致整个脚本无法运行）。`apply` 完成后请在外部终端手动重启。
 
 ![Patch脚本运行效果](images/patch.webp)
 
@@ -235,7 +237,7 @@ cd ~/.hermes/plugins/mattermost-enhancer
 
 ### 前提条件
 
-- ✅ 已经在用 [Hermes Agent](https://github.com/nousresearch/hermes-agent)（版本 ≥ 0.14.0）
+- ✅ 已经在用 [Hermes Agent](https://github.com/nousresearch/hermes-agent)（版本 v2026.9+）
 - ✅ 有一个 Mattermost 服务器，Bot 账号已配好
 - ✅ Python 3.11+
 
@@ -385,14 +387,15 @@ A: 不会。它只做了最小改动，你可以用 `check` 随时查看状态�
 
 **Q: 我不想装脚本，有什么影响？**
 
-A: 以下 Bug 得不到修复（上面标注「Shell Patch」的 #7-11）：
-- 工具进度消息不会出现在 Thread 里（会跳到频道主聊天流）
+A: 以下 Bug 得不到修复（上面标注「Shell Patch」的 #8、#10）：
 - Clarify 会话分裂：新的消息可能被当成新对话（AI 失忆）
-- Clarify 期间可能创建重复会话
 - Gateway 重启后同频道多 Thread session 互相串台
-- 回复碎片化：AI 回复被拆成多条独立消息
 
-其他功能（Adapter 覆写的 #1-6）都正常工作。
+其他问题（#7 进度进 Thread、#9 并发守护）上游已修复，无需脚本；Adapter 覆写的 #1-6 功能不受影响。
+
+**Q: 为什么 `apply` 完没有自动重启？**
+
+A: 这是有意设计。Hermes 的安全钩子会拒绝从 gateway 进程内部发起的重启，旧版脚本内嵌重启调用后，导致在 gateway 会话里连 `check` 都无法执行。新版脚本只打补丁 + 打印提示，请在外部终端手动重启。
 
 ---
 

@@ -4,8 +4,11 @@
 职责：
   - get_available_models(): 获取当前 profile 下所有可用模型名称列表
   - get_models_by_provider(): 按 provider 分组返回模型列表
-  - validate_model_id(): 校验模型 ID 是否可用
-  - get_session_model(): 获取指定 session 当前使用的模型
+  - resolve_provider_config(): 解析指定 provider 的连接配置
+  - _resolve_provider_for_model(): 根据模型 ID 反查 provider 名
+
+（v2026.9.2 清理：validate_model_id / get_session_model 从未被调用，已移除；
+后者依赖的 sessions.db 元数据结构也已随上游 SessionState 改版失效。）
 """
 from __future__ import annotations
 
@@ -204,32 +207,5 @@ def _resolve_provider_for_model(model_id: str) -> str:
 
     except Exception as e:
         logger.debug("Failed to resolve provider for model %s: %s", model_id, e)
-
-    return ""
-
-
-def validate_model_id(model_id: str) -> bool:
-    """校验 model_id 是否在当前可用模型列表中。"""
-    available = get_available_models()
-    return model_id in available
-
-
-def get_session_model(session_key: str) -> str:
-    """获取指定 session 当前使用的模型。"""
-    try:
-        from hermes_state import SessionDB
-        from hermes_constants import get_hermes_home
-
-        db_path = get_hermes_home() / "sessions" / "sessions.db"
-        if db_path.exists():
-            db = SessionDB(str(db_path))
-            session = db.get_session(session_key)
-            if session:
-                if isinstance(session, dict):
-                    return session.get("metadata", {}).get("model", "")
-                elif hasattr(session, "metadata"):
-                    return session.metadata.get("model", "")
-    except Exception as e:
-        logger.debug("Failed to get session model via SessionDB: %s", e)
 
     return ""

@@ -214,7 +214,9 @@ async def main():
 
     print("\n── 2. 审批按钮回调 — 纯内存立即返回 ──")
     # 注册一个 pending approval（直接用真实 tools.approval 状态）
-    entry = approval_mod._ApprovalEntry({"command": "ls -la"})
+    # v2026.9.7 对齐：_ApprovalEntry 已从 tools.approval 拆到 tools.approval_gateway_wait
+    from tools.approval_gateway_wait import _ApprovalEntry
+    entry = _ApprovalEntry({"command": "ls -la"})
     approval_mod._gateway_queues["agent:main:mattermost:dm:ch1"] = [entry]
 
     body = {
@@ -340,7 +342,7 @@ async def main():
         "post_id": "post_busy_1",
         "channel_id": "dm2",
     }
-    entry2 = approval_mod._ApprovalEntry({"command": "echo"})
+    entry2 = _ApprovalEntry({"command": "echo"})
     approval_mod._gateway_queues["agent:main:mattermost:dm:ch2"] = [entry2]
 
     status, resp, elapsed = post("/mattermost/callback", body)

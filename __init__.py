@@ -69,6 +69,10 @@ def _model_inheritance_hook(event, gateway, session_store, **kwargs):
     当用户在 Channel 中通过 /model 切换模型后，新建的 Thread 自动继承
     Channel 的模型设置，无需在每个 Thread 中重复切换。
 
+    session key 通过上游 build_session_key() 构建 — 与 Gateway 单一真源一致。
+    历史教训：手拼 key 缺少 per-user 后缀，group/channel 层级的 override
+    （agent:main:mattermost:group:{chat}:{user}）永远查不到。
+
     返回 {"action": "allow"} 始终放行消息，不改变消息处理流程。
     """
     import logging as _logging
@@ -83,25 +87,34 @@ def _model_inheritance_hook(event, gateway, session_store, **kwargs):
         return {"action": "allow"}
 
     try:
-        # 构造 session key（与 build_session_key 逻辑一致）
-        chat_type = source.chat_type or "channel"
-        platform = source.platform.value
-        chat_id = source.chat_id
-
-        thread_key = f"agent:main:{platform}:{chat_type}:{chat_id}:{source.thread_id}"
-        parent_key = f"agent:main:{platform}:{chat_type}:{chat_id}"
+        overrides = gateway._session_model_overrides
 
         # Thread 已有 override → 不做任何事（用户已在 Thread 内独立切模型）
-        if thread_key in gateway._session_model_overrides:
+        thread_key = gateway._session_key_for_source(source)
+        if thread_key in overrides:
             return {"action": "allow"}
 
-        # 查父 Channel 是否有 override
-        parent_override = gateway._session_model_overrides.get(parent_key)
+        # 查父 Channel 是否有 override（同一 chat、无 thread_id 的 source）
+        try:
+            from gateway.session import SessionSource as _SS
+            parent_source = _SS(
+                platform=source.platform, chat_id=source.chat_id,
+                chat_type=source.chat_type, user_id=source.user_id,
+                user_name=source.user_name, thread_id=None,
+            )
+        except Exception:
+            parent_source = None
+        parent_key = (
+            gateway._session_key_for_source(parent_source)
+            if parent_source is not None and hasattr(gateway, "_session_key_for_source")
+            else None
+        )
+        parent_override = overrides.get(parent_key) if parent_key else None
         if not parent_override:
             return {"action": "allow"}
 
         # 继承 Channel 的模型设置到 Thread
-        gateway._session_model_overrides[thread_key] = dict(parent_override)
+        overrides[thread_key] = dict(parent_override)
 
         _log.info(
             "Model inherited: thread=%s ← channel=%s model=%s",
