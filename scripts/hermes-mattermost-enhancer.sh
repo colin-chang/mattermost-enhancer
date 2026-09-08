@@ -60,6 +60,17 @@
 #     E-P3. run_inbound.py (Clarify 并发)     — ✅ 上游统一拦截架构覆盖，移除
 #     E-P4. run_startup.py (Session 串台去重) — ❌ 未合入，新锚点 ✅ 唯一
 #
+#   插件侧同步审计（adapter.py，v2026.9.7）：
+#     退役覆写 9 个（上游 _post_message 链已覆盖）：send_multiple_images /
+#     send_image / send_image_file / send_document / send_video / send_voice /
+#     _derive_reply_to / _send_local_file / _send_url_as_file；
+#     send() 改为 footer 拦截 + 委托上游；edit_message 只留 metadata 兼容 +
+#     空内容防护（上游 PUT 已带 30s timeout）；_resolve_root_id 签名对齐
+#     （str→str，失败回退 post_id）；补上 __init__ 缺失的 super().__init__；
+#     session_key 改用上游 build_session_key（per-user 规则对齐，见 state.db）；
+#     移除死代码 _update_bot_post（_api_put 已被上游删除）与
+#     send_model_picker（恒失败覆写会阻断上游 picker 探测）。
+#
 # 使用方法：
 #   ./scripts/hermes-mattermost-enhancer.sh check   # 检查状态
 #   ./scripts/hermes-mattermost-enhancer.sh apply   # 应用补丁（打印重启提示）
